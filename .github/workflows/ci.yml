@@ -1,0 +1,59 @@
+# One tree, one job.
+#
+# It gates a release rather than a merge: the wasm this produces is what gets deployed, and the
+# size check below is the only thing standing between a silently disabled release profile and a
+# contract that costs more to upload for no reason anyone would notice.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info is the largest thing in the cache and nothing here reads a backtrace line number.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  contract:
+    name: contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain comes from rust-toolchain.toml, which also pins the wasm32v1-none target
+      # and llvm-tools-preview. Naming a version here as well would give two answers to one
+      # question and they would eventually differ.
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      # Coverage over the contract's own source — the test modules and the two testnet mocks are
+      # excluded, because the question a reviewer is asking is how much of the CONTRACT the suite
+      # reaches. Printed to the job log rather than gated on a threshold: a number nobody chose is
+      # not a standard, and a threshold set to match today's figure only ever gets lowered.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: coverage
+        run: |
+          cargo llvm-cov --workspace \
+            --ignore-filename-regex '(src/test/|mock-oracle/|mock-token/)' \
+            --summary-only
+
+      # --workspace, not the root package alone: mock-oracle is only a dev-dependency of the
+      # vault, so a plain build never produces its wasm and scripts/demo.sh cannot deploy a
+      # controllable feed.
+      - run: cargo build --workspace --target wasm32v1-none --release
+
+      - name: wasm size
+        run: |
+          ls -l target/wasm32v1-none/release/collateral_vault.wasm
+          size=$(stat -c%s target/wasm32v1-none/release/collateral_vault.wasm)
+          echo "collateral_vault.wasm is $size bytes"
+          # Soroban charges for the wasm it uploads, and the release profile carries
+          # opt-level="z", lto and strip specifically to keep this down. A jump means one of them
+          # stopped applying — which happens silently if the crate is ever absorbed into an outer
+          # Cargo workspace, because [profile.release] only takes effect at a workspace root.
+          test "$size" -lt 262144 || { echo "wasm exceeded 256 KiB — check [profile.release]"; exit 1; }
